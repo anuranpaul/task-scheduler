@@ -1,0 +1,43 @@
+FROM golang:1.24-alpine AS builder
+
+# Install build dependencies
+RUN apk add --no-cache git ca-certificates tzdata
+
+WORKDIR /app
+
+# Copy go mod files
+COPY go.mod go.sum ./
+RUN go mod download
+
+# Copy source code
+COPY worker/main.go ./
+
+# Build the binary
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
+    -ldflags='-w -s -extldflags "-static"' \
+    -a -installsuffix cgo \
+    -o worker .
+
+# Final stage
+FROM alpine:3.19
+
+# Install CA certificates for HTTPS
+RUN apk --no-cache add ca-certificates tzdata
+
+# Create non-root user
+RUN addgroup -g 1000 worker && \
+    adduser -D -u 1000 -G worker worker
+
+WORKDIR /cmd
+
+# Copy binary from builder
+COPY --from=builder /cmd/worker /cmd/worker
+
+# Set ownership
+RUN chown -R worker:worker /app
+
+# Switch to non-root user
+USER worker
+
+# Run the worker
+ENTRYPOINT ["/cmd/worker"]

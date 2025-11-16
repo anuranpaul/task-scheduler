@@ -1,0 +1,288 @@
+package main
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"log"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	_ "github.com/lib/pq"
+	"github.com/redis/go-redis/v9"
+)
+
+type Worker struct {
+	id       string
+	db       *sql.DB
+	rdb      *redis.Client
+	stream   string
+	group    string
+	shutdown chan struct{}
+}
+
+func NewWorker(id, pgDSN, redisURL string) (*Worker, error) {
+	db, err := sql.Open("postgres", pgDSN)
+	if err != nil {
+		return nil, fmt.Errorf("postgres connection failed: %w", err)
+	}
+
+	// Test connection with timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := db.PingContext(ctx); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("postgres ping failed: %w", err)
+	}
+
+	db.SetMaxOpenConns(10)
+	db.SetMaxIdleConns(5)
+	db.SetConnMaxLifetime(time.Hour)
+
+	rdb := redis.NewClient(&redis.Options{
+		Addr:         redisURL,
+		DialTimeout:  5 * time.Second,
+		ReadTimeout:  3 * time.Second,
+		WriteTimeout: 3 * time.Second,
+	})
+
+	if err := rdb.Ping(ctx).Err(); err != nil {
+		db.Close()
+		rdb.Close()
+		return nil, fmt.Errorf("redis connection failed: %w", err)
+	}
+
+	return &Worker{
+		id:       id,
+		db:       db,
+		rdb:      rdb,
+		stream:   "jobs",
+		group:    "workers",
+		shutdown: make(chan struct{}),
+	}, nil
+}
+
+func (w *Worker) Start(ctx context.Context) error {
+	err := w.rdb.XGroupCreateMkStream(ctx, w.stream, w.group, "0").Err()
+	if err != nil && err.Error() != "BUSYGROUP Consumer Group name already exists" {
+		return fmt.Errorf("failed to create consumer group: %w", err)
+	}
+
+	log.Printf("Worker %s started", w.id)
+
+	go w.recoverPendingJobs(ctx)
+
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Printf("Worker %s shutting down gracefully", w.id)
+			return nil
+		case <-w.shutdown:
+			return nil
+		case <-ticker.C:
+			if err := w.processNextJob(ctx); err != nil {
+				if errors.Is(err, redis.Nil) {
+					continue 
+				}
+				log.Printf("Error processing job: %v", err)
+			}
+		}
+	}
+}
+
+func (w *Worker) processNextJob(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	streams, err := w.rdb.XReadGroup(ctx, &redis.XReadGroupArgs{
+		Group:    w.group,
+		Consumer: w.id,
+		Streams:  []string{w.stream, ">"},
+		Count:    1,
+		Block:    5 * time.Second,
+	}).Result()
+
+	if err != nil {
+		return err
+	}
+
+	for _, s := range streams {
+		for _, msg := range s.Messages {
+			if err := w.processMessage(ctx, msg); err != nil {
+				log.Printf("Failed to process message %s: %v", msg.ID, err)
+				return err
+			}
+
+			if err := w.rdb.XAck(ctx, w.stream, w.group, msg.ID).Err(); err != nil {
+				log.Printf("Failed to ack message %s: %v", msg.ID, err)
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+func (w *Worker) processMessage(ctx context.Context, msg redis.XMessage) error {
+	jobID, ok := msg.Values["job_id"].(string)
+	if !ok {
+		return fmt.Errorf("invalid job_id in message")
+	}
+
+	payload := msg.Values["payload"]
+	log.Printf("Worker %s processing job %s: %v", w.id, jobID, payload)
+
+
+	tx, err := w.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	_, err = tx.ExecContext(ctx,
+		"UPDATE jobs SET status='running', worker_id=$1, started_at=NOW() WHERE id=$2 AND status='pending'",
+		w.id, jobID)
+	if err != nil {
+		return fmt.Errorf("failed to update job status: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit status update: %w", err)
+	}
+
+	if err := w.doWork(ctx, payload); err != nil {
+		if _, dbErr := w.db.ExecContext(ctx,
+			"UPDATE jobs SET status='failed', error=$1, completed_at=NOW() WHERE id=$2",
+			err.Error(), jobID); dbErr != nil {
+			log.Printf("Failed to mark job as failed: %v", dbErr)
+		}
+		return fmt.Errorf("job processing failed: %w", err)
+	}
+
+	_, err = w.db.ExecContext(ctx,
+		"UPDATE jobs SET status='completed', completed_at=NOW() WHERE id=$1",
+		jobID)
+	if err != nil {
+		return fmt.Errorf("failed to mark job as completed: %w", err)
+	}
+
+	log.Printf("Worker %s completed job %s", w.id, jobID)
+	return nil
+}
+
+func (w *Worker) doWork(ctx context.Context, payload interface{}) error {
+	select {
+	case <-time.After(2 * time.Second):
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (w *Worker) recoverPendingJobs(ctx context.Context) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			w.claimStalledJobs(ctx)
+		}
+	}
+}
+
+func (w *Worker) claimStalledJobs(ctx context.Context) {
+	pending, err := w.rdb.XPendingExt(ctx, &redis.XPendingExtArgs{
+		Stream: w.stream,
+		Group:  w.group,
+		Start:  "-",
+		End:    "+",
+		Count:  10,
+		Idle:   5 * time.Minute,
+	}).Result()
+
+	if err != nil {
+		log.Printf("Failed to get pending jobs: %v", err)
+		return
+	}
+
+	for _, p := range pending {
+		claimed, err := w.rdb.XClaim(ctx, &redis.XClaimArgs{
+			Stream:   w.stream,
+			Group:    w.group,
+			Consumer: w.id,
+			MinIdle:  5 * time.Minute,
+			Messages: []string{p.ID},
+		}).Result()
+
+		if err != nil {
+			log.Printf("Failed to claim message %s: %v", p.ID, err)
+			continue
+		}
+
+		for _, msg := range claimed {
+			log.Printf("Worker %s claimed stalled job %s", w.id, msg.ID)
+			if err := w.processMessage(ctx, msg); err != nil {
+				log.Printf("Failed to process claimed job: %v", err)
+			} else {
+				w.rdb.XAck(ctx, w.stream, w.group, msg.ID)
+			}
+		}
+	}
+}
+
+func (w *Worker) Close() error {
+	close(w.shutdown)
+	
+	if err := w.db.Close(); err != nil {
+		log.Printf("Error closing database: %v", err)
+	}
+	
+	if err := w.rdb.Close(); err != nil {
+		log.Printf("Error closing redis: %v", err)
+	}
+	
+	return nil
+}
+
+func main() {
+	pgDSN := os.Getenv("POSTGRES_DSN")
+	redisURL := os.Getenv("REDIS_URL")
+	workerID := os.Getenv("WORKER_ID")
+
+	if pgDSN == "" || redisURL == "" || workerID == "" {
+		log.Fatal("Missing required environment variables")
+	}
+
+	worker, err := NewWorker(workerID, pgDSN, redisURL)
+	if err != nil {
+		log.Fatalf("Failed to create worker: %v", err)
+	}
+	defer worker.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+
+	go func() {
+		<-sigChan
+		log.Println("Received shutdown signal")
+		cancel()
+	}()
+
+	if err := worker.Start(ctx); err != nil {
+		log.Fatalf("Worker error: %v", err)
+	}
+
+	log.Println("Worker shut down successfully")
+}
