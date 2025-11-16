@@ -1,0 +1,9 @@
+# Go
+/bin/
+/vendor/
+*.log
+*.env
+
+# IDE
+.vscode/
+.idea/
