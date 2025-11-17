@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/anuranpaul/task-scheduler/pkg/config"
 	"github.com/anuranpaul/task-scheduler/pkg/logger"
 	_ "github.com/lib/pq"
 	"github.com/redis/go-redis/v9"
@@ -24,8 +25,8 @@ type Worker struct {
 	shutdown chan struct{}
 }
 
-func NewWorker(id, pgDSN, redisURL string) (*Worker, error) {
-	db, err := sql.Open("postgres", pgDSN)
+func NewWorker(cfg *config.Config, id string) (*Worker, error) {
+	db, err := sql.Open("postgres", cfg.DB.DSN)
 	if err != nil {
 		return nil, fmt.Errorf("postgres connection failed: %w", err)
 	}
@@ -38,15 +39,15 @@ func NewWorker(id, pgDSN, redisURL string) (*Worker, error) {
 		return nil, fmt.Errorf("postgres ping failed: %w", err)
 	}
 
-	db.SetMaxOpenConns(10)
-	db.SetMaxIdleConns(5)
-	db.SetConnMaxLifetime(time.Hour)
+	db.SetMaxOpenConns(cfg.DB.MaxOpenConns)
+	db.SetMaxIdleConns(cfg.DB.MaxIdleConns)
+	db.SetConnMaxLifetime(cfg.DB.ConnMaxLifetime)
 
 	rdb := redis.NewClient(&redis.Options{
-		Addr:         redisURL,
-		DialTimeout:  5 * time.Second,
-		ReadTimeout:  3 * time.Second,
-		WriteTimeout: 3 * time.Second,
+		Addr:         cfg.Redis.URL,
+		DialTimeout:  cfg.Redis.DialTimeout,
+		ReadTimeout:  cfg.Redis.ReadTimeout,
+		WriteTimeout: cfg.Redis.WriteTimeout,
 	})
 
 	if err := rdb.Ping(ctx).Err(); err != nil {
@@ -59,8 +60,8 @@ func NewWorker(id, pgDSN, redisURL string) (*Worker, error) {
 		id:       id,
 		db:       db,
 		rdb:      rdb,
-		stream:   "jobs",
-		group:    "workers",
+		stream:   cfg.StreamName,
+		group:    cfg.GroupName,
 		shutdown: make(chan struct{}),
 	}, nil
 }
@@ -262,16 +263,19 @@ func (w *Worker) Close() error {
 
 func main() {
 	logger.Init()
-	pgDSN := os.Getenv("POSTGRES_DSN")
-	redisURL := os.Getenv("REDIS_URL")
-	workerID := os.Getenv("WORKER_ID")
-
-	if pgDSN == "" || redisURL == "" || workerID == "" {
-		logger.Error(context.Background(), "missing required environment variables", fmt.Errorf("POSTGRES_DSN, REDIS_URL and WORKER_ID are required"))
+	cfg, err := config.Load(context.Background())
+	if err != nil {
+		logger.Error(context.Background(), "failed to load config", err)
 		os.Exit(1)
 	}
 
-	worker, err := NewWorker(workerID, pgDSN, redisURL)
+	workerID, err := config.LoadWorkerID(context.Background())
+	if err != nil {
+		logger.Error(context.Background(), "failed to load worker id", err)
+		os.Exit(1)
+	}
+
+	worker, err := NewWorker(cfg, workerID)
 	if err != nil {
 		logger.Error(context.Background(), "failed to create worker", err)
 		os.Exit(1)

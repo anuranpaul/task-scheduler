@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/anuranpaul/task-scheduler/pkg/config"
 	"github.com/anuranpaul/task-scheduler/pkg/logger"
 	_ "github.com/lib/pq"
 	"github.com/redis/go-redis/v9"
@@ -29,6 +30,7 @@ type Scheduler struct {
 	stream       string
 	shutdownChan chan struct{}
 	httpServer   *http.Server
+	httpAddr     string
 }
 
 type JobRequest struct {
@@ -44,8 +46,8 @@ type JobResponse struct {
 	CreatedAt string `json:"created_at"`
 }
 
-func NewScheduler(pgDSN, redisURL string, etcdEndpoints []string) (*Scheduler, error) {
-	db, err := sql.Open("postgres", pgDSN)
+func NewScheduler(cfg *config.Config) (*Scheduler, error) {
+	db, err := sql.Open("postgres", cfg.DB.DSN)
 	if err != nil {
 		return nil, fmt.Errorf("postgres connection failed: %w", err)
 	}
@@ -58,15 +60,15 @@ func NewScheduler(pgDSN, redisURL string, etcdEndpoints []string) (*Scheduler, e
 		return nil, fmt.Errorf("postgres ping failed: %w", err)
 	}
 
-	db.SetMaxOpenConns(25)
-	db.SetMaxIdleConns(10)
-	db.SetConnMaxLifetime(time.Hour)
+	db.SetMaxOpenConns(cfg.DB.MaxOpenConns)
+	db.SetMaxIdleConns(cfg.DB.MaxIdleConns)
+	db.SetConnMaxLifetime(cfg.DB.ConnMaxLifetime)
 
 	rdb := redis.NewClient(&redis.Options{
-		Addr:         redisURL,
-		DialTimeout:  5 * time.Second,
-		ReadTimeout:  3 * time.Second,
-		WriteTimeout: 3 * time.Second,
+		Addr:         cfg.Redis.URL,
+		DialTimeout:  cfg.Redis.DialTimeout,
+		ReadTimeout:  cfg.Redis.ReadTimeout,
+		WriteTimeout: cfg.Redis.WriteTimeout,
 	})
 
 	if err := rdb.Ping(ctx).Err(); err != nil {
@@ -76,8 +78,8 @@ func NewScheduler(pgDSN, redisURL string, etcdEndpoints []string) (*Scheduler, e
 	}
 
 	etcdCli, err := clientv3.New(clientv3.Config{
-		Endpoints:   etcdEndpoints,
-		DialTimeout: 5 * time.Second,
+		Endpoints:   cfg.Etcd.Endpoints,
+		DialTimeout: cfg.Etcd.DialTimeout,
 	})
 	if err != nil {
 		db.Close()
@@ -95,7 +97,8 @@ func NewScheduler(pgDSN, redisURL string, etcdEndpoints []string) (*Scheduler, e
 		rdb:          rdb,
 		etcdCli:      etcdCli,
 		instanceID:   instanceID,
-		stream:       "jobs",
+		stream:       cfg.StreamName,
+		httpAddr:     cfg.HTTP.Addr,
 		shutdownChan: make(chan struct{}),
 	}, nil
 }
@@ -321,7 +324,7 @@ func (s *Scheduler) setupHTTPServer() {
 	mux.HandleFunc("/jobs/", s.handleJobStatus)
 
 	s.httpServer = &http.Server{
-		Addr:         ":8080",
+		Addr:         s.httpAddr,
 		Handler:      mux,
 		ReadTimeout:  15 * time.Second,
 		WriteTimeout: 15 * time.Second,
@@ -544,18 +547,13 @@ func (s *Scheduler) shutdown() error {
 
 func main() {
 	logger.Init()
-	pgDSN := os.Getenv("POSTGRES_DSN")
-	redisURL := os.Getenv("REDIS_URL")
-	etcdEndpoint := os.Getenv("ETCD_ENDPOINT")
-
-	if pgDSN == "" || redisURL == "" || etcdEndpoint == "" {
-		logger.Error(context.Background(), "missing required environment variables", fmt.Errorf("POSTGRES_DSN, REDIS_URL, ETCD_ENDPOINT are required"))
+	cfg, err := config.Load(context.Background())
+	if err != nil {
+		logger.Error(context.Background(), "failed to load configuration", err)
 		os.Exit(1)
 	}
 
-	etcdEndpoints := []string{etcdEndpoint}
-
-	scheduler, err := NewScheduler(pgDSN, redisURL, etcdEndpoints)
+	scheduler, err := NewScheduler(cfg)
 	if err != nil {
 		logger.Error(context.Background(), "failed to create scheduler", err)
 		os.Exit(1)
