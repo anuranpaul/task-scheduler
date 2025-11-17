@@ -5,12 +5,12 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"log"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
+	"github.com/anuranpaul/task-scheduler/pkg/logger"
 	_ "github.com/lib/pq"
 	"github.com/redis/go-redis/v9"
 )
@@ -71,7 +71,8 @@ func (w *Worker) Start(ctx context.Context) error {
 		return fmt.Errorf("failed to create consumer group: %w", err)
 	}
 
-	log.Printf("Worker %s started", w.id)
+	ctx = logger.With(ctx, "worker", w.id)
+	logger.Info(ctx, "worker started")
 
 	go w.recoverPendingJobs(ctx)
 
@@ -81,16 +82,16 @@ func (w *Worker) Start(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
-			log.Printf("Worker %s shutting down gracefully", w.id)
+			logger.Info(ctx, "shutting down gracefully")
 			return nil
 		case <-w.shutdown:
 			return nil
 		case <-ticker.C:
 			if err := w.processNextJob(ctx); err != nil {
 				if errors.Is(err, redis.Nil) {
-					continue 
+					continue
 				}
-				log.Printf("Error processing job: %v", err)
+				logger.Error(ctx, "error processing job", err)
 			}
 		}
 	}
@@ -115,12 +116,12 @@ func (w *Worker) processNextJob(ctx context.Context) error {
 	for _, s := range streams {
 		for _, msg := range s.Messages {
 			if err := w.processMessage(ctx, msg); err != nil {
-				log.Printf("Failed to process message %s: %v", msg.ID, err)
+				logger.Error(ctx, "failed to process message", err, "message_id", msg.ID)
 				return err
 			}
 
 			if err := w.rdb.XAck(ctx, w.stream, w.group, msg.ID).Err(); err != nil {
-				log.Printf("Failed to ack message %s: %v", msg.ID, err)
+				logger.Error(ctx, "failed to ack message", err, "message_id", msg.ID)
 				return err
 			}
 		}
@@ -134,13 +135,14 @@ func (w *Worker) processMessage(ctx context.Context, msg redis.XMessage) error {
 	if !ok {
 		return fmt.Errorf("invalid job_id in message")
 	}
-
 	payload := msg.Values["payload"]
-	log.Printf("Worker %s processing job %s: %v", w.id, jobID, payload)
 
+	ctx = logger.With(ctx, "job_id", jobID)
+	logger.Info(ctx, "processing job", "payload", payload)
 
 	tx, err := w.db.BeginTx(ctx, nil)
 	if err != nil {
+		logger.Error(ctx, "failed to begin transaction", err)
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
 	defer tx.Rollback()
@@ -149,10 +151,12 @@ func (w *Worker) processMessage(ctx context.Context, msg redis.XMessage) error {
 		"UPDATE jobs SET status='running', worker_id=$1, started_at=NOW() WHERE id=$2 AND status='pending'",
 		w.id, jobID)
 	if err != nil {
+		logger.Error(ctx, "failed to update job status", err)
 		return fmt.Errorf("failed to update job status: %w", err)
 	}
 
 	if err := tx.Commit(); err != nil {
+		logger.Error(ctx, "failed to commit status update", err)
 		return fmt.Errorf("failed to commit status update: %w", err)
 	}
 
@@ -160,8 +164,9 @@ func (w *Worker) processMessage(ctx context.Context, msg redis.XMessage) error {
 		if _, dbErr := w.db.ExecContext(ctx,
 			"UPDATE jobs SET status='failed', error=$1, completed_at=NOW() WHERE id=$2",
 			err.Error(), jobID); dbErr != nil {
-			log.Printf("Failed to mark job as failed: %v", dbErr)
+			logger.Error(ctx, "failed to mark job as failed", dbErr)
 		}
+		logger.Error(ctx, "job processing failed", err)
 		return fmt.Errorf("job processing failed: %w", err)
 	}
 
@@ -169,14 +174,16 @@ func (w *Worker) processMessage(ctx context.Context, msg redis.XMessage) error {
 		"UPDATE jobs SET status='completed', completed_at=NOW() WHERE id=$1",
 		jobID)
 	if err != nil {
+		logger.Error(ctx, "failed to mark job as completed", err)
 		return fmt.Errorf("failed to mark job as completed: %w", err)
 	}
 
-	log.Printf("Worker %s completed job %s", w.id, jobID)
+	logger.Info(ctx, "completed job")
 	return nil
 }
 
 func (w *Worker) doWork(ctx context.Context, payload interface{}) error {
+	_ = payload
 	select {
 	case <-time.After(2 * time.Second):
 		return nil
@@ -210,7 +217,7 @@ func (w *Worker) claimStalledJobs(ctx context.Context) {
 	}).Result()
 
 	if err != nil {
-		log.Printf("Failed to get pending jobs: %v", err)
+		logger.Error(ctx, "failed to get pending jobs", err)
 		return
 	}
 
@@ -224,14 +231,14 @@ func (w *Worker) claimStalledJobs(ctx context.Context) {
 		}).Result()
 
 		if err != nil {
-			log.Printf("Failed to claim message %s: %v", p.ID, err)
+			logger.Error(ctx, "failed to claim message", err, "message_id", p.ID)
 			continue
 		}
 
 		for _, msg := range claimed {
-			log.Printf("Worker %s claimed stalled job %s", w.id, msg.ID)
+			logger.Info(ctx, "claimed stalled job", "message_id", msg.ID)
 			if err := w.processMessage(ctx, msg); err != nil {
-				log.Printf("Failed to process claimed job: %v", err)
+				logger.Error(ctx, "failed to process claimed job", err, "message_id", msg.ID)
 			} else {
 				w.rdb.XAck(ctx, w.stream, w.group, msg.ID)
 			}
@@ -241,30 +248,33 @@ func (w *Worker) claimStalledJobs(ctx context.Context) {
 
 func (w *Worker) Close() error {
 	close(w.shutdown)
-	
+
 	if err := w.db.Close(); err != nil {
-		log.Printf("Error closing database: %v", err)
+		logger.Error(context.Background(), "error closing database", err)
 	}
-	
+
 	if err := w.rdb.Close(); err != nil {
-		log.Printf("Error closing redis: %v", err)
+		logger.Error(context.Background(), "error closing redis", err)
 	}
-	
+
 	return nil
 }
 
 func main() {
+	logger.Init()
 	pgDSN := os.Getenv("POSTGRES_DSN")
 	redisURL := os.Getenv("REDIS_URL")
 	workerID := os.Getenv("WORKER_ID")
 
 	if pgDSN == "" || redisURL == "" || workerID == "" {
-		log.Fatal("Missing required environment variables")
+		logger.Error(context.Background(), "missing required environment variables", fmt.Errorf("POSTGRES_DSN, REDIS_URL and WORKER_ID are required"))
+		os.Exit(1)
 	}
 
 	worker, err := NewWorker(workerID, pgDSN, redisURL)
 	if err != nil {
-		log.Fatalf("Failed to create worker: %v", err)
+		logger.Error(context.Background(), "failed to create worker", err)
+		os.Exit(1)
 	}
 	defer worker.Close()
 
@@ -276,13 +286,14 @@ func main() {
 
 	go func() {
 		<-sigChan
-		log.Println("Received shutdown signal")
+		logger.Info(context.Background(), "received shutdown signal")
 		cancel()
 	}()
 
 	if err := worker.Start(ctx); err != nil {
-		log.Fatalf("Worker error: %v", err)
+		logger.Error(context.Background(), "worker error", err)
+		os.Exit(1)
 	}
 
-	log.Println("Worker shut down successfully")
+	logger.Info(context.Background(), "worker shut down successfully")
 }

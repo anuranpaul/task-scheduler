@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
 	"os"
 	"os/signal"
@@ -13,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/anuranpaul/task-scheduler/pkg/logger"
 	_ "github.com/lib/pq"
 	"github.com/redis/go-redis/v9"
 	clientv3 "go.etcd.io/etcd/client/v3"
@@ -101,15 +101,17 @@ func NewScheduler(pgDSN, redisURL string, etcdEndpoints []string) (*Scheduler, e
 }
 
 func (s *Scheduler) Start(ctx context.Context) error {
+	ctx = logger.With(ctx, "instance", s.instanceID)
 	if err := s.initSchema(ctx); err != nil {
 		return fmt.Errorf("schema init failed: %w", err)
 	}
 
 	s.setupHTTPServer()
 	go func() {
-		log.Printf("Starting HTTP server on %s", s.httpServer.Addr)
+		logger.Info(ctx, "starting http server", "addr", s.httpServer.Addr)
 		if err := s.httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("HTTP server error: %v", err)
+			logger.Error(ctx, "http server error", err)
+			os.Exit(1)
 		}
 	}()
 
@@ -144,13 +146,14 @@ func (s *Scheduler) initSchema(ctx context.Context) error {
 }
 
 func (s *Scheduler) runLeaderElection(ctx context.Context) {
+	localCtx := logger.With(ctx, "instance", s.instanceID)
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		default:
 			if err := s.campaignForLeader(ctx); err != nil {
-				log.Printf("Leader election error: %v, retrying in 5s", err)
+				logger.Error(localCtx, "leader election error, retrying in 5s", err)
 				time.Sleep(5 * time.Second)
 			}
 		}
@@ -170,7 +173,7 @@ func (s *Scheduler) campaignForLeader(ctx context.Context) error {
 		return fmt.Errorf("campaign failed: %w", err)
 	}
 
-	log.Printf("Instance %s became leader", s.instanceID)
+	logger.Info(ctx, "became leader", "instance", s.instanceID)
 	s.setLeader(true)
 
 	leaderCtx, cancel := context.WithCancel(ctx)
@@ -181,7 +184,7 @@ func (s *Scheduler) campaignForLeader(ctx context.Context) error {
 
 	select {
 	case <-sess.Done():
-		log.Println("Lost leader session")
+		logger.Info(ctx, "lost leader session")
 		s.setLeader(false)
 		return nil
 	case <-ctx.Done():
@@ -191,19 +194,20 @@ func (s *Scheduler) campaignForLeader(ctx context.Context) error {
 }
 
 func (s *Scheduler) runJobDispatcher(ctx context.Context) {
+	localCtx := logger.With(ctx, "instance", s.instanceID)
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
-	log.Println("Job dispatcher started")
+	logger.Info(localCtx, "job dispatcher started")
 
 	for {
 		select {
 		case <-ctx.Done():
-			log.Println("Job dispatcher stopped")
+			logger.Info(localCtx, "job dispatcher stopped")
 			return
 		case <-ticker.C:
 			if err := s.dispatchPendingJobs(ctx); err != nil {
-				log.Printf("Error dispatching jobs: %v", err)
+				logger.Error(localCtx, "error dispatching jobs", err)
 			}
 		}
 	}
@@ -231,12 +235,12 @@ func (s *Scheduler) dispatchPendingJobs(ctx context.Context) error {
 		var priority int
 
 		if err := rows.Scan(&id, &payload, &priority); err != nil {
-			log.Printf("Failed to scan job: %v", err)
+			logger.Error(ctx, "failed to scan job", err)
 			continue
 		}
 
 		if err := s.dispatchJob(ctx, id, payload, priority); err != nil {
-			log.Printf("Failed to dispatch job %d: %v", id, err)
+			logger.Error(ctx, "failed to dispatch job", err, "job_id", id)
 			continue
 		}
 
@@ -244,7 +248,7 @@ func (s *Scheduler) dispatchPendingJobs(ctx context.Context) error {
 	}
 
 	if dispatched > 0 {
-		log.Printf("Dispatched %d jobs", dispatched)
+		logger.Info(ctx, "dispatched jobs", "count", dispatched)
 	}
 
 	return rows.Err()
@@ -275,25 +279,26 @@ func (s *Scheduler) dispatchJob(ctx context.Context, jobID int, payload string, 
 		return fmt.Errorf("failed to update job status: %w", err)
 	}
 
-	log.Printf("Dispatched job %d to stream (priority: %d)", jobID, priority)
+	logger.Info(ctx, "dispatched job to stream", "job_id", jobID, "priority", priority)
 	return nil
 }
 
 func (s *Scheduler) runScheduledJobChecker(ctx context.Context) {
+	localCtx := logger.With(ctx, "instance", s.instanceID)
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 
-	log.Println("Scheduled job checker started")
+	logger.Info(localCtx, "scheduled job checker started")
 
 	for {
 		select {
 		case <-ctx.Done():
-			log.Println("Scheduled job checker stopped")
+			logger.Info(localCtx, "scheduled job checker stopped")
 			return
 		case <-ticker.C:
 			count, _ := s.getScheduledJobCount(ctx)
 			if count > 0 {
-				log.Printf("Found %d scheduled jobs", count)
+				logger.Info(localCtx, "found scheduled jobs", "count", count)
 			}
 		}
 	}
@@ -390,7 +395,7 @@ func (s *Scheduler) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 	).Scan(&jobID, &status, &createdAt)
 
 	if err != nil {
-		log.Printf("DB insert error: %v", err)
+		logger.Error(ctx, "db insert error", err)
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
@@ -405,7 +410,7 @@ func (s *Scheduler) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusCreated)
 	json.NewEncoder(w).Encode(response)
 
-	log.Printf("Created job %d (priority: %d, scheduled: %v)", jobID, req.Priority, scheduleAt != nil)
+	logger.Info(ctx, "created job", "job_id", jobID, "priority", req.Priority, "scheduled", scheduleAt != nil)
 }
 
 func (s *Scheduler) handleListJobs(w http.ResponseWriter, r *http.Request) {
@@ -511,45 +516,49 @@ func (s *Scheduler) setLeader(leader bool) {
 }
 
 func (s *Scheduler) shutdown() error {
-	log.Println("Shutting down scheduler...")
+	lctx := logger.With(context.Background(), "instance", s.instanceID)
+	logger.Info(lctx, "shutting down scheduler")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	if err := s.httpServer.Shutdown(ctx); err != nil {
-		log.Printf("HTTP server shutdown error: %v", err)
+		logger.Error(lctx, "http server shutdown error", err)
 	}
 
 	if err := s.db.Close(); err != nil {
-		log.Printf("Database close error: %v", err)
+		logger.Error(lctx, "database close error", err)
 	}
 
 	if err := s.rdb.Close(); err != nil {
-		log.Printf("Redis close error: %v", err)
+		logger.Error(lctx, "redis close error", err)
 	}
 
 	if err := s.etcdCli.Close(); err != nil {
-		log.Printf("Etcd close error: %v", err)
+		logger.Error(lctx, "etcd close error", err)
 	}
 
-	log.Println("Scheduler shut down successfully")
+	logger.Info(lctx, "scheduler shut down successfully")
 	return nil
 }
 
 func main() {
+	logger.Init()
 	pgDSN := os.Getenv("POSTGRES_DSN")
 	redisURL := os.Getenv("REDIS_URL")
 	etcdEndpoint := os.Getenv("ETCD_ENDPOINT")
 
 	if pgDSN == "" || redisURL == "" || etcdEndpoint == "" {
-		log.Fatal("Missing required environment variables: POSTGRES_DSN, REDIS_URL, ETCD_ENDPOINT")
+		logger.Error(context.Background(), "missing required environment variables", fmt.Errorf("POSTGRES_DSN, REDIS_URL, ETCD_ENDPOINT are required"))
+		os.Exit(1)
 	}
 
 	etcdEndpoints := []string{etcdEndpoint}
 
 	scheduler, err := NewScheduler(pgDSN, redisURL, etcdEndpoints)
 	if err != nil {
-		log.Fatalf("Failed to create scheduler: %v", err)
+		logger.Error(context.Background(), "failed to create scheduler", err)
+		os.Exit(1)
 	}
 
 	// Setup graceful shutdown
@@ -561,12 +570,13 @@ func main() {
 
 	go func() {
 		<-sigChan
-		log.Println("Received shutdown signal")
+		logger.Info(context.Background(), "received shutdown signal")
 		cancel()
 	}()
 
 	// Start scheduler
 	if err := scheduler.Start(ctx); err != nil {
-		log.Fatalf("Scheduler error: %v", err)
+		logger.Error(context.Background(), "scheduler error", err)
+		os.Exit(1)
 	}
 }
