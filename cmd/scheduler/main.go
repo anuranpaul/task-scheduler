@@ -105,9 +105,6 @@ func NewScheduler(cfg *config.Config) (*Scheduler, error) {
 
 func (s *Scheduler) Start(ctx context.Context) error {
 	ctx = logger.With(ctx, "instance", s.instanceID)
-	if err := s.initSchema(ctx); err != nil {
-		return fmt.Errorf("schema init failed: %w", err)
-	}
 
 	s.setupHTTPServer()
 	go func() {
@@ -125,27 +122,9 @@ func (s *Scheduler) Start(ctx context.Context) error {
 }
 
 func (s *Scheduler) initSchema(ctx context.Context) error {
-	schema := `
-	CREATE TABLE IF NOT EXISTS jobs (
-		id SERIAL PRIMARY KEY,
-		payload TEXT NOT NULL,
-		dedupe_key VARCHAR(255) UNIQUE,
-		status VARCHAR(50) DEFAULT 'pending',
-		priority INTEGER DEFAULT 0,
-		schedule_at TIMESTAMP,
-		worker_id VARCHAR(255),
-		started_at TIMESTAMP,
-		completed_at TIMESTAMP,
-		error TEXT,
-		retry_count INTEGER DEFAULT 0,
-		created_at TIMESTAMP DEFAULT NOW(),
-		updated_at TIMESTAMP DEFAULT NOW()
-	);
-	CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
-	CREATE INDEX IF NOT EXISTS idx_jobs_schedule_at ON jobs(schedule_at) WHERE schedule_at IS NOT NULL;
-	`
-	_, err := s.db.ExecContext(ctx, schema)
-	return err
+	// Schema is managed by init.sql / external migrations. No-op here.
+	logger.Info(ctx, "initSchema skipped: schema managed via init.sql/migrations")
+	return nil
 }
 
 func (s *Scheduler) runLeaderElection(ctx context.Context) {
