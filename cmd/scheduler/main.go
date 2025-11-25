@@ -13,31 +13,37 @@ import (
 	"time"
 
 	"github.com/anuranpaul/task-scheduler/pkg/config"
+	"github.com/anuranpaul/task-scheduler/pkg/coordination"
 	"github.com/anuranpaul/task-scheduler/pkg/logger"
 	_ "github.com/lib/pq"
 	"github.com/redis/go-redis/v9"
-	clientv3 "go.etcd.io/etcd/client/v3"
-	"go.etcd.io/etcd/client/v3/concurrency"
 )
 
 type Scheduler struct {
-	db           *sql.DB
-	rdb          *redis.Client
-	etcdCli      *clientv3.Client
-	instanceID   string
-	leader       bool
-	leaderMu     sync.RWMutex
-	stream       string
-	shutdownChan chan struct{}
-	httpServer   *http.Server
-	httpAddr     string
+	db             *sql.DB
+	rdb            *redis.Client
+	coord          *coordinator.Coordinator
+	instanceID     string
+	leader         bool
+	leaderMu       sync.RWMutex
+	leaderElection *coordinator.LeaderElection
+	serviceReg     *coordinator.ServiceRegistry
+	stream         string
+	shutdownChan   chan struct{}
+	httpServer     *http.Server
+	httpAddr       string
+	
+	// Metrics and state
+	jobsDispatched   int64
+	lastDispatchTime time.Time
+	metricsMu        sync.RWMutex
 }
 
 type JobRequest struct {
 	Payload    string `json:"payload"`
 	DedupeKey  string `json:"dedupe_key,omitempty"`
-	Priority   int    `json:"priority"`           
-	ScheduleAt string `json:"schedule_at,omitempty"` 
+	Priority   int    `json:"priority"`
+	ScheduleAt string `json:"schedule_at,omitempty"`
 }
 
 type JobResponse struct {
@@ -77,35 +83,56 @@ func NewScheduler(cfg *config.Config) (*Scheduler, error) {
 		return nil, fmt.Errorf("redis connection failed: %w", err)
 	}
 
-	etcdCli, err := clientv3.New(clientv3.Config{
+	// Initialize coordination layer
+	coord, err := coordinator.NewCoordinator(ctx, coordinator.CoordinatorConfig{
 		Endpoints:   cfg.Etcd.Endpoints,
 		DialTimeout: cfg.Etcd.DialTimeout,
+		InstanceID:  getInstanceID(),
+		Namespace:   "/task-scheduler",
 	})
 	if err != nil {
 		db.Close()
 		rdb.Close()
-		return nil, fmt.Errorf("etcd connection failed: %w", err)
-	}
-
-	instanceID, _ := os.Hostname()
-	if instanceID == "" {
-		instanceID = fmt.Sprintf("scheduler-%d", time.Now().Unix())
+		return nil, fmt.Errorf("coordinator initialization failed: %w", err)
 	}
 
 	return &Scheduler{
 		db:           db,
 		rdb:          rdb,
-		etcdCli:      etcdCli,
-		instanceID:   instanceID,
+		coord:        coord,
+		instanceID:   getInstanceID(),
 		stream:       cfg.StreamName,
 		httpAddr:     cfg.HTTP.Addr,
 		shutdownChan: make(chan struct{}),
 	}, nil
 }
 
+func getInstanceID() string {
+	instanceID, _ := os.Hostname()
+	if instanceID == "" {
+		instanceID = fmt.Sprintf("scheduler-%d", time.Now().Unix())
+	}
+	return instanceID
+}
+
 func (s *Scheduler) Start(ctx context.Context) error {
 	ctx = logger.With(ctx, "instance", s.instanceID)
 
+	// Register service for discovery
+	metadata := map[string]string{
+		"type":       "scheduler",
+		"version":    "1.0.0",
+		"http_addr":  s.httpAddr,
+		"started_at": time.Now().Format(time.RFC3339),
+	}
+	
+	serviceReg, err := s.coord.NewServiceRegistry(ctx, "scheduler", metadata, 10)
+	if err != nil {
+		return fmt.Errorf("failed to register service: %w", err)
+	}
+	s.serviceReg = serviceReg
+
+	// Setup HTTP server
 	s.setupHTTPServer()
 	go func() {
 		logger.Info(ctx, "starting http server", "addr", s.httpServer.Addr)
@@ -115,68 +142,71 @@ func (s *Scheduler) Start(ctx context.Context) error {
 		}
 	}()
 
+	// Start leader election with callbacks
 	go s.runLeaderElection(ctx)
 
 	<-ctx.Done()
-	return s.shutdown()
-}
-
-func (s *Scheduler) initSchema(ctx context.Context) error {
-	// Schema is managed by init.sql / external migrations. No-op here.
-	logger.Info(ctx, "initSchema skipped: schema managed via init.sql/migrations")
-	return nil
+	return s.shutdown(ctx)
 }
 
 func (s *Scheduler) runLeaderElection(ctx context.Context) {
 	localCtx := logger.With(ctx, "instance", s.instanceID)
+	
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		default:
-			if err := s.campaignForLeader(ctx); err != nil {
-				logger.Error(localCtx, "leader election error, retrying in 5s", err)
-				time.Sleep(5 * time.Second)
+			// Create leader election with callbacks
+			callbacks := coordinator.LeaderCallbacks{
+				OnElected: func(electionCtx context.Context) error {
+					logger.Info(electionCtx, "became leader - starting job dispatchers")
+					s.setLeader(true)
+					
+					// Start background tasks as leader
+					go s.runJobDispatcher(electionCtx)
+					go s.runScheduledJobChecker(electionCtx)
+					go s.runMetricsCollector(electionCtx)
+					
+					return nil
+				},
+				OnRevoked: func(revocationCtx context.Context) error {
+					logger.Info(revocationCtx, "lost leadership - stopping dispatchers")
+					s.setLeader(false)
+					return nil
+				},
+				OnError: func(errorCtx context.Context, err error) {
+					logger.Error(errorCtx, "leader election error", err)
+				},
 			}
+
+			election, err := s.coord.NewLeaderElection(localCtx, "scheduler-leader", 10, callbacks)
+			if err != nil {
+				logger.Error(localCtx, "failed to create leader election", err)
+				time.Sleep(5 * time.Second)
+				continue
+			}
+			s.leaderElection = election
+
+			// Campaign for leadership (blocking)
+			if err := election.Campaign(localCtx); err != nil {
+				logger.Error(localCtx, "campaign failed", err)
+				election.Close()
+				time.Sleep(5 * time.Second)
+				continue
+			}
+
+			// Observe leadership changes
+			election.Observe(localCtx)
+			
+			// Clean up on exit
+			election.Close()
 		}
 	}
 }
 
-func (s *Scheduler) campaignForLeader(ctx context.Context) error {
-	sess, err := concurrency.NewSession(s.etcdCli, concurrency.WithTTL(10))
-	if err != nil {
-		return fmt.Errorf("failed to create session: %w", err)
-	}
-	defer sess.Close()
-
-	election := concurrency.NewElection(sess, "/scheduler/leader")
-
-	if err := election.Campaign(ctx, s.instanceID); err != nil {
-		return fmt.Errorf("campaign failed: %w", err)
-	}
-
-	logger.Info(ctx, "became leader", "instance", s.instanceID)
-	s.setLeader(true)
-
-	leaderCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	go s.runJobDispatcher(leaderCtx)
-	go s.runScheduledJobChecker(leaderCtx)
-
-	select {
-	case <-sess.Done():
-		logger.Info(ctx, "lost leader session")
-		s.setLeader(false)
-		return nil
-	case <-ctx.Done():
-		s.setLeader(false)
-		return election.Resign(context.Background())
-	}
-}
-
 func (s *Scheduler) runJobDispatcher(ctx context.Context) {
-	localCtx := logger.With(ctx, "instance", s.instanceID)
+	localCtx := logger.With(ctx, "component", "dispatcher", "instance", s.instanceID)
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
@@ -188,6 +218,10 @@ func (s *Scheduler) runJobDispatcher(ctx context.Context) {
 			logger.Info(localCtx, "job dispatcher stopped")
 			return
 		case <-ticker.C:
+			if !s.isLeader() {
+				return 
+			}
+			
 			if err := s.dispatchPendingJobs(ctx); err != nil {
 				logger.Error(localCtx, "error dispatching jobs", err)
 			}
@@ -196,7 +230,20 @@ func (s *Scheduler) runJobDispatcher(ctx context.Context) {
 }
 
 func (s *Scheduler) dispatchPendingJobs(ctx context.Context) error {
-	// Get pending jobs that are ready to run
+	lock, err := s.coord.NewDistributedLock(ctx, "job-dispatch", 5)
+	if err != nil {
+		return fmt.Errorf("failed to create lock: %w", err)
+	}
+	defer lock.Close()
+
+	acquired, err := lock.TryLock(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to try lock: %w", err)
+	}
+	if !acquired {
+		return nil
+	}
+	defer lock.Unlock(ctx)
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, payload, priority 
 		FROM jobs 
@@ -230,6 +277,7 @@ func (s *Scheduler) dispatchPendingJobs(ctx context.Context) error {
 	}
 
 	if dispatched > 0 {
+		s.updateMetrics(dispatched)
 		logger.Info(ctx, "dispatched jobs", "count", dispatched)
 	}
 
@@ -251,12 +299,10 @@ func (s *Scheduler) dispatchJob(ctx context.Context, jobID int, payload string, 
 		return fmt.Errorf("failed to add to stream: %w", err)
 	}
 
-	// Update job status to queued
 	_, err = s.db.ExecContext(ctx,
 		"UPDATE jobs SET status='queued', updated_at=NOW() WHERE id=$1",
 		jobID)
 	if err != nil {
-		// Try to remove from stream if DB update fails
 		s.rdb.XDel(ctx, s.stream, streamID)
 		return fmt.Errorf("failed to update job status: %w", err)
 	}
@@ -266,7 +312,7 @@ func (s *Scheduler) dispatchJob(ctx context.Context, jobID int, payload string, 
 }
 
 func (s *Scheduler) runScheduledJobChecker(ctx context.Context) {
-	localCtx := logger.With(ctx, "instance", s.instanceID)
+	localCtx := logger.With(ctx, "component", "scheduled-checker", "instance", s.instanceID)
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 
@@ -278,12 +324,86 @@ func (s *Scheduler) runScheduledJobChecker(ctx context.Context) {
 			logger.Info(localCtx, "scheduled job checker stopped")
 			return
 		case <-ticker.C:
+			if !s.isLeader() {
+				return
+			}
+			
 			count, _ := s.getScheduledJobCount(ctx)
 			if count > 0 {
 				logger.Info(localCtx, "found scheduled jobs", "count", count)
 			}
 		}
 	}
+}
+
+func (s *Scheduler) runMetricsCollector(ctx context.Context) {
+	localCtx := logger.With(ctx, "component", "metrics", "instance", s.instanceID)
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	logger.Info(localCtx, "metrics collector started")
+
+	for {
+		select {
+		case <-ctx.Done():
+			logger.Info(localCtx, "metrics collector stopped")
+			return
+		case <-ticker.C:
+			if !s.isLeader() {
+				return
+			}
+			
+			// Collect and store system metrics
+			metrics := s.collectMetrics(ctx)
+			if err := s.storeMetrics(ctx, metrics); err != nil {
+				logger.Error(localCtx, "failed to store metrics", err)
+			}
+		}
+	}
+}
+
+func (s *Scheduler) collectMetrics(ctx context.Context) map[string]interface{} {
+	var pendingCount, queuedCount, runningCount, completedCount, failedCount int
+	
+	s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM jobs WHERE status='pending'").Scan(&pendingCount)
+	s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM jobs WHERE status='queued'").Scan(&queuedCount)
+	s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM jobs WHERE status='running'").Scan(&runningCount)
+	s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM jobs WHERE status='completed'").Scan(&completedCount)
+	s.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM jobs WHERE status='failed'").Scan(&failedCount)
+
+	s.metricsMu.RLock()
+	dispatched := s.jobsDispatched
+	lastDispatch := s.lastDispatchTime
+	s.metricsMu.RUnlock()
+
+	return map[string]interface{}{
+		"timestamp":       time.Now().Unix(),
+		"pending_jobs":    pendingCount,
+		"queued_jobs":     queuedCount,
+		"running_jobs":    runningCount,
+		"completed_jobs":  completedCount,
+		"failed_jobs":     failedCount,
+		"total_jobs":      pendingCount + queuedCount + runningCount + completedCount + failedCount,
+		"jobs_dispatched": dispatched,
+		"last_dispatch":   lastDispatch.Unix(),
+	}
+}
+
+func (s *Scheduler) storeMetrics(ctx context.Context, metrics map[string]interface{}) error {
+	metricsJSON, err := json.Marshal(metrics)
+	if err != nil {
+		return err
+	}
+	
+	key := fmt.Sprintf("metrics/scheduler/%s", s.instanceID)
+	return s.coord.SetKey(ctx, key, string(metricsJSON))
+}
+
+func (s *Scheduler) updateMetrics(dispatched int) {
+	s.metricsMu.Lock()
+	defer s.metricsMu.Unlock()
+	s.jobsDispatched += int64(dispatched)
+	s.lastDispatchTime = time.Now()
 }
 
 func (s *Scheduler) getScheduledJobCount(ctx context.Context) (int, error) {
@@ -299,6 +419,8 @@ func (s *Scheduler) setupHTTPServer() {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/health", s.handleHealth)
+	mux.HandleFunc("/metrics", s.handleMetrics)
+	mux.HandleFunc("/leader", s.handleLeaderInfo)
 	mux.HandleFunc("/jobs", s.handleJobs)
 	mux.HandleFunc("/jobs/", s.handleJobStatus)
 
@@ -313,14 +435,41 @@ func (s *Scheduler) setupHTTPServer() {
 
 func (s *Scheduler) handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
+	coordHealthy := s.coord.Health(r.Context()) == nil
 	
 	status := map[string]interface{}{
-		"status":      "healthy",
-		"instance_id": s.instanceID,
-		"is_leader":   s.isLeader(),
+		"status":             "healthy",
+		"instance_id":        s.instanceID,
+		"is_leader":          s.isLeader(),
+		"coordinator_health": coordHealthy,
+		"timestamp":          time.Now().Unix(),
 	}
 
 	json.NewEncoder(w).Encode(status)
+}
+
+func (s *Scheduler) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	
+	metrics := s.collectMetrics(r.Context())
+	json.NewEncoder(w).Encode(metrics)
+}
+
+func (s *Scheduler) handleLeaderInfo(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	
+	var leaderID string
+	if s.leaderElection != nil {
+		leaderID, _ = s.leaderElection.GetLeader(r.Context())
+	}
+	
+	info := map[string]interface{}{
+		"current_leader": leaderID,
+		"is_leader":      s.isLeader(),
+		"instance_id":    s.instanceID,
+	}
+	
+	json.NewEncoder(w).Encode(info)
 }
 
 func (s *Scheduler) handleJobs(w http.ResponseWriter, r *http.Request) {
@@ -369,8 +518,8 @@ func (s *Scheduler) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 		RETURNING id, status, created_at
 	`
 
-	err := s.db.QueryRowContext(ctx, query, 
-		req.Payload, 
+	err := s.db.QueryRowContext(ctx, query,
+		req.Payload,
 		sql.NullString{String: req.DedupeKey, Valid: req.DedupeKey != ""},
 		req.Priority,
 		scheduleAt,
@@ -397,15 +546,15 @@ func (s *Scheduler) handleCreateJob(w http.ResponseWriter, r *http.Request) {
 
 func (s *Scheduler) handleListJobs(w http.ResponseWriter, r *http.Request) {
 	status := r.URL.Query().Get("status")
-	
+
 	query := "SELECT id, payload, status, priority, created_at FROM jobs"
 	args := []interface{}{}
-	
+
 	if status != "" {
 		query += " WHERE status = $1"
 		args = append(args, status)
 	}
-	
+
 	query += " ORDER BY created_at DESC LIMIT 100"
 
 	rows, err := s.db.QueryContext(r.Context(), query, args...)
@@ -497,14 +646,27 @@ func (s *Scheduler) setLeader(leader bool) {
 	s.leader = leader
 }
 
-func (s *Scheduler) shutdown() error {
-	lctx := logger.With(context.Background(), "instance", s.instanceID)
+func (s *Scheduler) shutdown(ctx context.Context) error {
+	lctx := logger.With(ctx, "instance", s.instanceID)
 	logger.Info(lctx, "shutting down scheduler")
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	if err := s.httpServer.Shutdown(ctx); err != nil {
+	// Resign from leadership gracefully
+	if s.leaderElection != nil && s.isLeader() {
+		if err := s.leaderElection.Resign(shutdownCtx); err != nil {
+			logger.Error(lctx, "failed to resign leadership", err)
+		}
+		s.leaderElection.Close()
+	}
+	if s.serviceReg != nil {
+		if err := s.serviceReg.Deregister(shutdownCtx); err != nil {
+			logger.Error(lctx, "failed to deregister service", err)
+		}
+	}
+
+	if err := s.httpServer.Shutdown(shutdownCtx); err != nil {
 		logger.Error(lctx, "http server shutdown error", err)
 	}
 
@@ -516,8 +678,8 @@ func (s *Scheduler) shutdown() error {
 		logger.Error(lctx, "redis close error", err)
 	}
 
-	if err := s.etcdCli.Close(); err != nil {
-		logger.Error(lctx, "etcd close error", err)
+	if err := s.coord.Close(); err != nil {
+		logger.Error(lctx, "coordinator close error", err)
 	}
 
 	logger.Info(lctx, "scheduler shut down successfully")
