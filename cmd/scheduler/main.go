@@ -595,7 +595,8 @@ func (s *Scheduler) handleJobStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var status, workerID, errorMsg string
+	var status string
+	var workerID, errorMsg sql.NullString  // Both can be NULL
 	var startedAt, completedAt sql.NullTime
 	var createdAt time.Time
 
@@ -609,6 +610,7 @@ func (s *Scheduler) handleJobStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
+		logger.Error(r.Context(), "failed to query job", err, "job_id", jobID)
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
@@ -616,18 +618,24 @@ func (s *Scheduler) handleJobStatus(w http.ResponseWriter, r *http.Request) {
 	response := map[string]interface{}{
 		"id":         jobID,
 		"status":     status,
-		"worker_id":  workerID,
 		"created_at": createdAt.Format(time.RFC3339),
 	}
 
+	// Add optional fields only if present
+	if workerID.Valid && workerID.String != "" {
+		response["worker_id"] = workerID.String
+	}
+	
 	if startedAt.Valid {
 		response["started_at"] = startedAt.Time.Format(time.RFC3339)
 	}
+	
 	if completedAt.Valid {
 		response["completed_at"] = completedAt.Time.Format(time.RFC3339)
 	}
-	if errorMsg != "" {
-		response["error"] = errorMsg
+	
+	if errorMsg.Valid && errorMsg.String != "" {
+		response["error"] = errorMsg.String
 	}
 
 	w.Header().Set("Content-Type", "application/json")
