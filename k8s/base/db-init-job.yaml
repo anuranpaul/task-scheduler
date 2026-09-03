@@ -1,0 +1,27 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: db-init
+spec:
+  backoffLimit: 12
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: db-init
+          image: postgres:15-alpine
+          command: [sh, -c, psql "$POSTGRES_DSN" -v ON_ERROR_STOP=1 -f /sql/init.sql]
+          env:
+            - name: POSTGRES_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-credentials
+                  key: POSTGRES_DSN
+          volumeMounts:
+            - name: init-sql
+              mountPath: /sql
+              readOnly: true
+      volumes:
+        - name: init-sql
+          configMap:
+            name: init-sql-file

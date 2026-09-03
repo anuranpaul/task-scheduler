@@ -71,8 +71,8 @@ WHERE status IN ('pending', 'queued', 'running');
 
 -- Composite index for the dispatcher query (most critical path)
 -- Optimizes: SELECT * FROM jobs WHERE status='pending' AND (schedule_at IS NULL OR schedule_at <= NOW()) ORDER BY priority DESC, created_at ASC
-CREATE INDEX idx_jobs_pending_dispatch ON jobs (priority DESC, created_at ASC) 
-WHERE status = 'pending' AND (schedule_at IS NULL OR schedule_at <= NOW());
+CREATE INDEX idx_jobs_pending_dispatch ON jobs (priority DESC, created_at ASC)
+WHERE status = 'pending';
 
 -- Index for scheduled jobs checker
 CREATE INDEX idx_jobs_scheduled ON jobs (schedule_at) 
