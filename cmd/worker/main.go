@@ -15,30 +15,32 @@ import (
 	"time"
 
 	"github.com/anuranpaul/task-scheduler/pkg/config"
-	"github.com/anuranpaul/task-scheduler/pkg/coordination"
+	coordinator "github.com/anuranpaul/task-scheduler/pkg/coordination"
+	"github.com/anuranpaul/task-scheduler/pkg/extractor"
 	"github.com/anuranpaul/task-scheduler/pkg/logger"
 	_ "github.com/lib/pq"
 	"github.com/redis/go-redis/v9"
 )
 
 type Worker struct {
-	id           string
-	db           *sql.DB
-	rdb          *redis.Client
-	coord        *coordinator.Coordinator
-	serviceReg   *coordinator.ServiceRegistry
-	stream       string
-	group        string
-	shutdownCh     chan struct{}
-	httpServer   *http.Server
-	httpAddr     string
-	
+	id         string
+	db         *sql.DB
+	rdb        *redis.Client
+	coord      *coordinator.Coordinator
+	serviceReg *coordinator.ServiceRegistry
+	registry   *extractor.Registry
+	stream     string
+	group      string
+	shutdownCh chan struct{}
+	httpServer *http.Server
+	httpAddr   string
+
 	// Metrics
-	jobsProcessed   int64
-	jobsSucceeded   int64
-	jobsFailed      int64
-	lastJobTime     time.Time
-	metricsMu       sync.RWMutex
+	jobsProcessed int64
+	jobsSucceeded int64
+	jobsFailed    int64
+	lastJobTime   time.Time
+	metricsMu     sync.RWMutex
 }
 
 func NewWorker(cfg *config.Config, id string) (*Worker, error) {
@@ -49,7 +51,7 @@ func NewWorker(cfg *config.Config, id string) (*Worker, error) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	
+
 	if err := db.PingContext(ctx); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("postgres ping failed: %w", err)
@@ -90,14 +92,20 @@ func NewWorker(cfg *config.Config, id string) (*Worker, error) {
 		httpAddr = ":9090"
 	}
 
+	// Initialize extractor registry
+	registry := extractor.NewRegistry()
+	registry.Register(extractor.NewHTTPExtractor(nil))
+	registry.SetFallback(extractor.NewNoopExtractor(2 * time.Second))
+
 	return &Worker{
-		id:       id,
-		db:       db,
-		rdb:      rdb,
-		coord:    coord,
-		stream:   cfg.StreamName,
-		group:    cfg.GroupName,
-		httpAddr: httpAddr,
+		id:         id,
+		db:         db,
+		rdb:        rdb,
+		coord:      coord,
+		registry:   registry,
+		stream:     cfg.StreamName,
+		group:      cfg.GroupName,
+		httpAddr:   httpAddr,
 		shutdownCh: make(chan struct{}),
 	}, nil
 }
@@ -109,7 +117,7 @@ func (w *Worker) Start(ctx context.Context) error {
 	}
 
 	ctx = logger.With(ctx, "worker", w.id)
-	
+
 	// Register worker in service discovery
 	metadata := map[string]string{
 		"type":       "worker",
@@ -117,7 +125,7 @@ func (w *Worker) Start(ctx context.Context) error {
 		"http_addr":  w.httpAddr,
 		"started_at": time.Now().Format(time.RFC3339),
 	}
-	
+
 	serviceReg, err := w.coord.NewServiceRegistry(ctx, "worker", metadata, 10)
 	if err != nil {
 		return fmt.Errorf("failed to register service: %w", err)
@@ -189,7 +197,7 @@ func (w *Worker) processNextJob(ctx context.Context) error {
 				logger.Error(ctx, "failed to ack message", err, "message_id", msg.ID)
 				return err
 			}
-			
+
 			atomic.AddInt64(&w.jobsSucceeded, 1)
 		}
 	}
@@ -262,7 +270,7 @@ func (w *Worker) processMessage(ctx context.Context, msg redis.XMessage) error {
 	}
 
 	// Process the actual work
-	if err := w.doWork(ctx, payload); err != nil {
+	if err := w.doWork(ctx, fmt.Sprintf("%v", jobID), payload); err != nil {
 		if _, dbErr := w.db.ExecContext(ctx,
 			"UPDATE jobs SET status='failed', error=$1, completed_at=NOW() WHERE id=$2",
 			err.Error(), jobID); dbErr != nil {
@@ -284,15 +292,29 @@ func (w *Worker) processMessage(ctx context.Context, msg redis.XMessage) error {
 	return nil
 }
 
-func (w *Worker) doWork(ctx context.Context, payload interface{}) error {
-	// Simulate work with cancellation support
-	_ = payload
-	select {
-	case <-time.After(2 * time.Second):
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
+func (w *Worker) doWork(ctx context.Context, jobID string, payload interface{}) error {
+	payloadStr, ok := payload.(string)
+	if !ok {
+		// Try to convert to string if it's another type
+		payloadStr = fmt.Sprintf("%v", payload)
 	}
+
+	result, err := w.registry.Process(ctx, jobID, payloadStr)
+	if err != nil {
+		return err
+	}
+
+	if !result.Success {
+		if result.ErrorMsg != "" {
+			return fmt.Errorf("extractor failed: %s", result.ErrorMsg)
+		}
+		return fmt.Errorf("extractor failed")
+	}
+
+	logger.Info(ctx, "extractor completed",
+		"job_id", jobID,
+		"extractor", result.Metadata["extractor"])
+	return nil
 }
 
 func (w *Worker) recoverPendingJobs(ctx context.Context) {
@@ -373,12 +395,12 @@ func (w *Worker) collectMetrics() map[string]interface{} {
 	defer w.metricsMu.RUnlock()
 
 	return map[string]interface{}{
-		"timestamp":       time.Now().Unix(),
-		"worker_id":       w.id,
-		"jobs_processed":  atomic.LoadInt64(&w.jobsProcessed),
-		"jobs_succeeded":  atomic.LoadInt64(&w.jobsSucceeded),
-		"jobs_failed":     atomic.LoadInt64(&w.jobsFailed),
-		"last_job_time":   w.lastJobTime.Unix(),
+		"timestamp":      time.Now().Unix(),
+		"worker_id":      w.id,
+		"jobs_processed": atomic.LoadInt64(&w.jobsProcessed),
+		"jobs_succeeded": atomic.LoadInt64(&w.jobsSucceeded),
+		"jobs_failed":    atomic.LoadInt64(&w.jobsFailed),
+		"last_job_time":  w.lastJobTime.Unix(),
 	}
 }
 
@@ -387,7 +409,7 @@ func (w *Worker) reportMetrics(ctx context.Context, metrics map[string]interface
 	if err != nil {
 		return err
 	}
-	
+
 	key := fmt.Sprintf("metrics/worker/%s", w.id)
 	return w.coord.SetKey(ctx, key, string(metricsJSON))
 }
@@ -415,9 +437,9 @@ func (w *Worker) setupHTTPServer() {
 
 func (w *Worker) handleHealth(wr http.ResponseWriter, r *http.Request) {
 	wr.Header().Set("Content-Type", "application/json")
-	
+
 	coordHealthy := w.coord.Health(r.Context()) == nil
-	
+
 	status := map[string]interface{}{
 		"status":             "healthy",
 		"worker_id":          w.id,
@@ -430,7 +452,7 @@ func (w *Worker) handleHealth(wr http.ResponseWriter, r *http.Request) {
 
 func (w *Worker) handleMetrics(wr http.ResponseWriter, r *http.Request) {
 	wr.Header().Set("Content-Type", "application/json")
-	
+
 	metrics := w.collectMetrics()
 	json.NewEncoder(wr).Encode(metrics)
 }
